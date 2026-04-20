@@ -1,17 +1,15 @@
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
+from safety import check_safety, get_safety_system_prompt, HELPLINES
 
-# Load your API key from .env file
 load_dotenv()
 
-# Connect to OpenRouter (free models)
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
-# This is the "personality" of your AI companion
 SYSTEM_PROMPT = """
 You are YouMatter, a warm and empathetic AI mental health companion.
 Your goal is to make the user feel heard, understood, and supported.
@@ -26,23 +24,31 @@ Rules you must follow:
 """
 
 def chat(user_message, conversation_history=[]):
-    # Build the message list
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Step 1 — Check safety FIRST before anything else
+    safety_result = check_safety(user_message)
+
+    # Step 2 — Build dynamic system prompt based on safety level
+    dynamic_prompt = SYSTEM_PROMPT + get_safety_system_prompt(safety_result)
+
+    # Step 3 — Build messages
+    messages = [{"role": "system", "content": dynamic_prompt}]
     messages += conversation_history
     messages.append({"role": "user", "content": user_message})
 
-    # Call the free LLM via OpenRouter
+    # Step 4 — Get AI response
     response = client.chat.completions.create(
         model="openrouter/elephant-alpha",
         messages=messages,
     )
-
-    # Extract the reply text
     reply = response.choices[0].message.content
-    return reply
+
+    # Step 5 — If crisis, append helplines to response
+    if safety_result["level"] == "crisis":
+        reply += f"\n\n{HELPLINES}"
+
+    return reply, safety_result
 
 
-# Quick test
 if __name__ == "__main__":
     print("YouMatter AI is ready. Type 'quit' to exit.\n")
     history = []
@@ -52,9 +58,15 @@ if __name__ == "__main__":
         if user_input.lower() == "quit":
             break
 
-        response = chat(user_input, history)
+        response, safety = chat(user_input, history)
+
+        # Alert if crisis detected
+        if safety["level"] == "crisis":
+            print("\n🚨 CRISIS DETECTED — Guardian alert would be sent now\n")
+        elif safety["level"] == "distress":
+            print("\n⚠️  Distress detected — AI is in extra gentle mode\n")
+
         print(f"\nYouMatter: {response}\n")
 
-        # Save conversation so AI remembers context
         history.append({"role": "user", "content": user_input})
         history.append({"role": "assistant", "content": response})
