@@ -1,7 +1,7 @@
 import requests
 
-# Your backend base URL (will change when deployed)
-BACKEND_URL = "http://localhost:3000"
+# Your backend base URL 
+BACKEND_URL = "https://you-matter-backend.onrender.com/api/v1"
 
 def load_memory(user_id: str) -> list:
     """
@@ -27,17 +27,16 @@ def load_memory(user_id: str) -> list:
         return []
 
 
-def save_message(user_id: str, role: str, message: str):
-    """
-    Saves a single message to the backend.
-    role is either "user" or "assistant"
-    """
+def save_message(user_id: str, role: str, message: str, token: str = ""):
     try:
-        requests.post(f"{BACKEND_URL}/api/message", json={
-            "user_id": user_id,
-            "role": role,
-            "message": message
-        })
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        requests.post(f"{BACKEND_URL}/message", json={
+            "message": message,
+            "sender": role
+        }, headers=headers)
     except Exception as e:
         print(f"Memory save failed: {e}")
 
