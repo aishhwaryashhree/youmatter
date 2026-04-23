@@ -66,7 +66,15 @@ SEVERE_KEYWORDS = [
     # Other methods
     "bijli lagana khud ko", "electric shock khud ko",
     "nadi mein doobna", "dariya mein doobna",
-    "khud ko aag lagana",
+    "khud ko aag lagana", # More Hindi/Hinglish severe
+    "kal nahi rahunga", "kal nahi rahungi",
+    "aaj aakhri din hai", "yeh mera aakhri message",
+    "sab se alvida", "sabko alvida kehna hai",
+    "alvida dosto", "alvida zindagi",
+    "khud ko khatam kar lunga",
+    "khud ko khatam kar lungi",
+    "nahi bachunga", "nahi bachungi",
+    "ab kuch nahi bachha jeene ke liye",
 ]
 
 # Crisis keywords — serious but not immediate
@@ -78,7 +86,21 @@ CRISIS_KEYWORDS = [
     "goodbye forever", "nobody cares", "don't want to exist",
     "can't take it anymore", "cannot take it anymore",
     "i give up", "life is pointless", "what's the point",
-    "मरना चाहता हूं", "मरना चाहती हूं", "जीना नहीं चाहता",
+    "मरना चाहता हूं", "मरना चाहती हूं", "जीना नहीं चाहता",# More Hindi/Hinglish crisis
+    "sab khatam karna chahta hun",
+    "sab khatam karna chahti hun",
+    "khatam kar dun", "khatam kar lun",
+    "mar jana chahta hun", "mar jana chahti hun",
+    "jeene ka mann nahi", "jeena nahi chahta",
+    "jeena nahi chahti", "zindagi nahi chahiye",
+    "zindagi se thak gaya hun",
+    "zindagi se thak gayi hun",
+    "bahut thak gaya hun zindagi se",
+    "ab nahi rehna", "ab nahi jeena",
+    "chale jaana chahta hun",
+    "chale jaana chahti hun",
+    "sab chhod ke jaana chahta hun",
+    "duniya chhodni hai",
 ]
 
 # Distress keywords — struggling but not in immediate danger
@@ -101,7 +123,22 @@ DISTRESS_KEYWORDS = [
     "main kamzor hun", "haar gaya", "haar gayi",
     "thak gaya hun", "thak gayi hun",
     "koi umeed nahi", "sab khatam",
-    "akela hun", "akeli hun", "bilkul akela",
+    "akela hun", "akeli hun", "bilkul akela",# More Hindi/Hinglish distress
+    "dard ho raha hai", "bahut dard hai",
+    "ro raha hun", "ro rahi hun", "rona aa raha hai",
+    "aansu aa rahe hain", "aankhein bhar aayi",
+    "toot gaya hun", "toot gayi hun",
+    "bikhar gaya hun", "bikhar gayi hun",
+    "sambhal nahi pa raha", "sambhal nahi pa rahi",
+    "dar lag raha hai", "bohot dar lag raha hai",
+    "ghabra raha hun", "ghabra rahi hun",
+    "chinta ho rahi hai", "pareshan hun",
+    "neend nahi aa rahi", "kuch acha nahi lagta",
+    "dil nahi lagta", "man nahi lagta",
+    "bahut akela feel ho raha hai",
+    "koi nahi samjhta", "koi nahi samajhta",
+    "sab mujhse naraaz hain", "sab mujhe chhorh gaye",
+    "kuch nahi bachha", "sab kho diya",
 
     # Hinglish
     "feel like burden", "bohot akela feel hota",
