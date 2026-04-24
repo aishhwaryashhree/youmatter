@@ -116,8 +116,8 @@ Please follow up immediately.
 # Test
 if __name__ == "__main__":
     result = send_guardian_alert(
-        guardian_email="your_test_email@gmail.com",
-        user_name="Test User",
+        guardian_email="aishwaryashree15@gmail.com",
+        user_name="Aishwarya",
         urgent=False
     )
     print(f"Email sent: {result}")
