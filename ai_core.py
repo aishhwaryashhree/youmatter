@@ -1,3 +1,4 @@
+from email_service import send_guardian_alert, send_helpline_alert
 import os
 import requests
 from dotenv import load_dotenv
@@ -640,8 +641,17 @@ def chat(user_id: str, user_message: str, user_consent: dict = None):
     alert_sent = False
 
     if alert_decision.get("send_guardian") and user_consent.get("guardian_email"):
-        # Alert will be sent by backend when we call /api/crisis
-        alert_sent = True
+    urgent = safety_result["level"] == "severe"
+    user_name = user_consent.get("guardian_name", "your friend")
+    email_sent = send_guardian_alert(
+        guardian_email=user_consent.get("guardian_email"),
+        user_name=user_name,
+        urgent=urgent
+    )
+    alert_sent = email_sent
+
+if alert_decision.get("send_helpline") and safety_result["level"] == "severe":
+    send_helpline_alert(user_name=user_consent.get("guardian_name", "Unknown User"))
 
     # Step 10 — Show consent prompt if no consent given but crisis detected
     show_consent_prompt = (
