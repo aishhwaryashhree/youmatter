@@ -16,7 +16,7 @@ detects crisis situations, and responds like a caring friend — not a robot.
 - 👨‍👩‍👧 Guardian alert system with consent-based notifications
 - 📔 Diary and mood tracking
 - 🔒 Secure user data handling
-- 🧠 Short and long term memory system
+- 🧠 Short and long-term memory system
 
 ---
 
@@ -123,7 +123,7 @@ youmatter/
 
 - AI & Architecture — Aishwarya(project lead),Supriya(helped with prompts)
 - Backend — Node.js + Supabase -Harshita,Neeraj(helped with testing)
-- Frontend — React-Ankita,Simran,Rounit
+- Frontend — React-Ankita, Simran, Rounit
 
 ---
 
