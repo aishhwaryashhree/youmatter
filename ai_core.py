@@ -1,3 +1,6 @@
+import re
+
+from email_service import send_guardian_alert, send_helpline_alert
 import os
 import requests
 from dotenv import load_dotenv
@@ -613,23 +616,27 @@ def chat(user_id: str, user_message: str, user_consent: dict = None):
 
     # Step 7 — Get AI response via Sarvam
     payload = {
-    "model": "sarvam-105b",
+    "model": "sarvam-m",
     "messages": messages,
-    "max_tokens": 1000,
+    "max_tokens": 300,
     "temperature": 0.7,
     "extra_body": {
         "thinking": False
     }
-}
+   }
     headers = {
         "Authorization": f"Bearer {SARVAM_API_KEY}",
         "Content-Type": "application/json"
     }
     response = requests.post(SARVAM_URL, json=payload, headers=headers)
     response_data = response.json()
-    print("Sarvam response:", response_data)
-    reply = response_data["choices"][0]["message"]["content"]
-    reply = response_data["choices"][0]["message"]["content"]
+    import re
+    raw_reply = response_data["choices"][0]["message"]["content"] or ""
+    # Remove complete think blocks first
+    reply = re.sub(r'<think>.*?</think>', '', raw_reply, flags=re.DOTALL).strip()
+    # If still starts with <think> (unclosed), take content after </think> if exists, else keep raw
+    if reply.startswith('<think>'):
+       reply = raw_reply.split('</think>')[-1].strip() if '</think>' in raw_reply else raw_reply
 
     # Step 8 — Append helplines if crisis or severe
     if safety_result["level"] in ["crisis", "severe"]:
@@ -638,11 +645,18 @@ def chat(user_id: str, user_message: str, user_consent: dict = None):
     # Step 9 — Decide whether to send alerts
     alert_decision = should_send_alert(safety_result, user_consent)
     alert_sent = False
-
     if alert_decision.get("send_guardian") and user_consent.get("guardian_email"):
-        # Alert will be sent by backend when we call /api/crisis
-        alert_sent = True
+        urgent = safety_result["level"] == "severe"
+        user_name = user_consent.get("guardian_name", "your friend")
+        email_sent = send_guardian_alert(
+            guardian_email=user_consent.get("guardian_email"),
+            user_name=user_name,
+            urgent=urgent
+        )
+        alert_sent = email_sent
 
+    if alert_decision.get("send_helpline") and safety_result["level"] == "severe":
+        send_helpline_alert(user_name=user_consent.get("guardian_name", "Unknown User"))
     # Step 10 — Show consent prompt if no consent given but crisis detected
     show_consent_prompt = (
         safety_result["level"] in ["crisis", "severe"]
@@ -662,47 +676,46 @@ def chat(user_id: str, user_message: str, user_consent: dict = None):
         "ai_score": safety_result.get("ai_score", None)
     }
 
-
 if __name__ == "__main__":
-    print("YouMatter AI is ready. Type 'quit' to exit.")
+   print("YouMatter AI is ready. Type 'quit' to exit.")
 
-    user_id = input("Enter your user ID (or press Enter for 'test-user'): ").strip()
-    if not user_id:
-        user_id = "test-user"
+   user_id = input("Enter your user ID (or press Enter for 'test-user'): ").strip()
+   if not user_id:
+      user_id = "test-user"
 
-    print(f"\nLogged in as: {user_id}\n")
+   print(f"\nLogged in as: {user_id}\n")
 
-    # Test consent — in production this comes from database
-    test_consent = {
-        "guardian_alert": True,
-        "helpline_alert": True,
-        "alerts_paused": False,
-        "guardian_email": "guardian@example.com",
-        "guardian_name": "Guardian"
-    }
+   # Test consent — in production this comes from database
+   test_consent = {
+      "guardian_alert": True,
+      "helpline_alert": True,
+      "alerts_paused": False,
+      "guardian_email": "guardian@example.com",
+      "guardian_name": "Guardian"
+   }
 
-    while True:
-        user_input = input("You: ")
-        if user_input.lower() == "quit":
-            break
+   while True:
+      user_input = input("You: ")
+      if user_input.lower() == "quit":
+         break
 
-        result = chat(user_id, user_input, test_consent)
+      result = chat(user_id, user_input, test_consent)
 
-        # Show safety status
-        level = result["safety_level"]
-        if level == "severe":
-            print("\n🚨 SEVERE CRISIS — Alert sent, cannot be paused\n")
-        elif level == "crisis":
-            print("\n⚠️  CRISIS DETECTED — Guardian alert triggered\n")
-        elif level == "distress":
-            print("\n💛 Distress detected — AI in gentle mode\n")
+      # Show safety status
+      level = result["safety_level"]
+      if level == "severe":
+         print("\n🚨 SEVERE CRISIS — Alert sent, cannot be paused\n")
+      elif level == "crisis":
+         print("\n⚠️  CRISIS DETECTED — Guardian alert triggered\n")
+      elif level == "distress":
+         print("\n💛 Distress detected — AI in gentle mode\n")
 
-        # Show consent prompt if needed
-        if result["show_consent_prompt"]:
-            print("\n💬 [App would show: 'Can we contact someone you trust?']\n")
+      # Show consent prompt if needed
+      if result["show_consent_prompt"]:
+         print("\n💬 [App would show: 'Can we contact someone you trust?']\n")
 
-        # Show if request was blocked
-        if result["blocked"]:
-            print("\n🚫 Harmful request blocked\n")
+      # Show if request was blocked
+      if result["blocked"]:
+         print("\n🚫 Harmful request blocked\n")
 
-        print(f"\nYouMatter: {result['reply']}\n")
+      print(f"\nYouMatter: {result['reply']}\n")
