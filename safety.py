@@ -1,13 +1,22 @@
 # Safety Layer for YouMatter
 # Handles crisis detection, severity scoring, and consent-based alerts
 # Requests for harmful information — always blocked
+import numbers
+import os
+import re
+from dotenv import load_dotenv
+load_dotenv()
 BLOCKED_REQUESTS = [
     # Hanging
     "how to tie a noose", "hangman knot", "how to hang myself",
 
     # Pills and overdose
     "how to overdose", "lethal dose", "how many pills to die",
-    "kitni pills leni chahiye", "kon si pills leni chahiye",
+    "kitni pills leni chahiye", "kon si pills leni chahiye","how many pills to kill",
+    "sleeping pills to die",
+    "how many sleeping pills",
+    "lethal amount of pills",
+    "pills to overdose",
 
     # Cutting
     "how to slit", "how to cut my wrists",
@@ -49,6 +58,11 @@ SEVERE_KEYWORDS = [
     "मैंने फैसला कर लिया", "अब नहीं रहूंगा",
 
     # Ingestion methods
+    "drink this poison", "drink poison",
+    "drink this entire bottle", "bottle of poison",
+    "pee liya poison", "poison pi liya",
+    "zeher pi liya", "pi raha hun zeher",
+    "pi rahi hun zeher",
     "drink phenyl", "phenyl peena", "phenyl pi",
     "rat poison", "pest control peena",
     "drink bleach", "bleach peena",
@@ -300,41 +314,65 @@ Please check in on them when you get a chance — a simple message or call can m
 """
 
 def ai_danger_score(message: str, client) -> int:
-    """
-    Asks the AI to secretly rate the danger level of a message.
-    Returns a score from 1-10.
-    1 = completely safe
-    7 = crisis
-    9-10 = severe/immediate danger
-    """
+    import requests
+    import os
+    import re
+
+    SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+
     try:
-        response = client.chat.completions.create(
-            model="openrouter/elephant-alpha",
-            messages=[
-                {
-                    "role": "system",
-                    "content": """You are a mental health safety classifier.
-Your only job is to rate the danger level of a message from 1-10.
+        response = requests.post(
+            "https://api.sarvam.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {SARVAM_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+    "model": "sarvam-m",
+    "messages": [
+        {
+            "role": "system",
+            "content": """You are a mental health crisis detector for an Indian mental health app.
+Rate ONLY the self-harm or suicide risk from 1-10.
+Assume the worst plausible interpretation for ambiguous messages.
 
-Scoring guide:
-1-3 = Safe, normal conversation
-4-6 = Distress, struggling emotionally  
-7-8 = Crisis, mentions self harm or suicide
-9-10 = Severe, immediate danger, has a plan or means
+1-3 = Safe (general stress, sadness)
+4-6 = Distress (emotional pain, hopelessness)  
+7-8 = Crisis (self harm or suicide mentioned)
+9-10 = Severe (immediate danger, has plan or means)
 
-Reply with ONLY a single number. Nothing else. No explanation."""
-                },
-                {
-                    "role": "user",
-                    "content": message
-                }
-            ],
-            max_tokens=5  # We only need a single number
+"i bought a blade today" = 9 (means acquired)
+"kash main hoti hi nahi" = 8 (wishing non-existence)
+"i want to drink this bottle of poison" = 10
+"i feel sad" = 2
+
+Output the number then STOP."""
+        },
+        {
+            "role": "user",
+            "content": f"Rate danger level of: {message}"
+        }
+    ],
+    "max_tokens": 100,
+    "temperature": 0.1,
+    "reasoning_effort": "low"
+}
         )
-        score = int(response.choices[0].message.content.strip())
-        return max(1, min(10, score))  # Keep between 1-10
-    except:
-        return 1  # If AI fails, assume safe
+        data = response.json()
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        raw = content if content.strip() else reasoning
+
+        # Extract number from ANYWHERE in response including inside think blocks
+        numbers = re.findall(r'\b([1-9]|10)\b', raw)
+        if numbers:
+            return max(1, min(10, int(numbers[-1])))
+        return 1
+
+    except Exception as e:
+        print(f"[Safety scorer] Error: {e}")
+        return 1
 
 
 def check_safety_full(message: str, client) -> dict:
