@@ -616,7 +616,7 @@ def chat(user_id: str, user_message: str, user_consent: dict = None):
 
     # Step 7 — Get AI response via Sarvam
     payload = {
-    "model": "sarvam-m",
+    "model": "sarvam-105b",
     "messages": messages,
     "max_tokens": 300,
     "temperature": 0.7,
@@ -690,7 +690,7 @@ if __name__ == "__main__":
       "guardian_alert": True,
       "helpline_alert": True,
       "alerts_paused": False,
-      "guardian_email": "guardian@example.com",
+      "guardian_email": "aishwaryashree15@gmail.com",
       "guardian_name": "Guardian"
    }
 
