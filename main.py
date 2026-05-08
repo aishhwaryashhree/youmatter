@@ -1,15 +1,21 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ai_core import chat
 import uvicorn
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 
 app = FastAPI(title="YouMatter AI API")
 
 # Allow frontend to connect
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,14 +33,18 @@ class ChatRequest(BaseModel):
         "guardian_name": None
     }
 
-# Health check
+# Health check — no auth needed
 @app.get("/health")
 def health_check():
     return {"status": "YouMatter AI is running"}
 
-# Main chat endpoint
+# Main chat endpoint — protected
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, x_api_key: str = Header(None)):
+    # Check API key
+    if x_api_key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
     try:
         result = chat(
             user_id=request.user_id,
