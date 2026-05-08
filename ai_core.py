@@ -643,8 +643,6 @@ def chat(user_id: str, user_message: str, user_consent: dict = None):
         reply += f"\n\n{HELPLINES}"
 
     # Step 9 — Decide whether to send alerts
-    print(f"[DEBUG] user_consent received: {user_consent}")
-    print(f"[DEBUG] safety_level: {safety_result['level']}")
     alert_decision = should_send_alert(safety_result, user_consent)
     alert_sent = False
     if alert_decision.get("send_guardian") and user_consent.get("guardian_email"):
