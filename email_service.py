@@ -48,10 +48,21 @@ Please check in on them when you get a chance — a simple message or call can m
         """
 
     try:
+# Sandbox routing — remove after SES production access
+        if user_name == "Harshita Smriti":
+            to_email = "aishwaryashree15@gmail.com"
+        elif user_name == "Aishwarya Shree":
+            to_email = "harshitasmriti@gmail.com"
+        else:
+            if isinstance(guardian_email, list):
+                to_email = guardian_email[0]
+            else:
+                to_email = guardian_email
+
         response = ses_client.send_email(
             Source=YOUMATTER_EMAIL,
             Destination={
-                'ToAddresses': [guardian_email]
+                'ToAddresses': [to_email]
             },
             Message={
                 'Subject': {

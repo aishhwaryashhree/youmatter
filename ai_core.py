@@ -647,7 +647,7 @@ def chat(user_id: str, user_message: str, user_consent: dict = None):
     alert_sent = False
     if alert_decision.get("send_guardian") and user_consent.get("guardian_email"):
         urgent = safety_result["level"] == "severe"
-        user_name = user_consent.get("guardian_name", "your friend")
+        user_name = user_consent.get("user_name") or user_consent.get("guardian_name", "Unknown User")
         email_sent = send_guardian_alert(
             guardian_email=user_consent.get("guardian_email"),
             user_name=user_name,
