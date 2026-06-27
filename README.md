@@ -176,7 +176,7 @@ youmatter/
 
 ##  Team  
 
-- AI & Architecture — Aishwarya, Supriya  
+- AI & Architecture — Aishwarya 
 - Backend — Harshita, Neeraj  
 - Frontend — Ankita, Simran, Rounit  
 
