@@ -8,7 +8,6 @@ import time
 from email_service import send_guardian_alert, send_helpline_alert
 from dotenv import load_dotenv
 from safety import (
-    ai_danger_score,
     check_safety,
     get_safety_system_prompt,
     should_send_alert,
@@ -83,20 +82,31 @@ async def _get_ai_reply(http_client, messages: list) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Topic classifier — decides which TOPIC_PLAYBOOKS entries (if any) actually
-# apply to this message, so the reply-generation prompt only carries the
-# relevant playbook(s) instead of every one of them every time.
+# Topic classifier + danger scorer — MERGED into one call.
 #
-# This is separate from safety.py's check_safety()/ai_danger_score(): those
-# stay exactly as they are and keep deciding crisis/severe handling and
-# alerts. This classifier only affects tone/content relevance for non-crisis
-# topics. If it fails or returns nothing recognized, it fails safe to an
-# empty list — the reply still has the full CORE_PROMPT (including the
-# crisis pivot rule and safety rules), just no extra topic-specific script.
+# Previously these were two separate Sarvam round-trips: classify_topic()
+# (decides which TOPIC_PLAYBOOKS entries apply, so the reply prompt only
+# carries relevant playbook(s)) and safety.ai_danger_score() (the AI-side
+# half of the two-layer safety check, alongside the instant keyword layer
+# in safety.check_safety()). Both are small, structured, single-purpose
+# calls that only need the raw user message — neither needs conversation
+# history or the system prompt — so there's no reason they need to be two
+# network round-trips. classify_topic_and_score() asks for both in one
+# call and parses a strict two-line format out of the response.
+#
+# This does NOT change what safety.py decides — check_safety() (keyword
+# layer) and combine_keyword_and_ai_score() (score -> level upgrade logic)
+# are untouched. This only changes how the AI-side score gets produced.
+# If it fails or returns something unparseable, it fails safe exactly like
+# the two functions it replaces: topics -> [] (CORE_PROMPT alone is a safe
+# fallback), score -> 1 (keyword layer still runs, so a scorer outage
+# doesn't block chat).
 # ---------------------------------------------------------------------------
 
-TOPIC_CLASSIFIER_SYSTEM_PROMPT = """You are a topic classifier for a mental health companion app.
-Given a user's message, decide which topic(s) from the list below best describe what they are talking about.
+TOPIC_AND_SCORE_SYSTEM_PROMPT = """You are a message analyzer for an Indian mental health companion app.
+Given a user's message, do TWO things:
+
+1. TOPIC — decide which topic(s) from the list below best describe what they are talking about.
 
 casual_stress - everyday stress like exams, deadlines, minor daily problems
 anxiety_trauma - anxiety, panic, trauma responses
@@ -124,24 +134,59 @@ severe_crisis - immediate danger, has a plan or means to harm themselves
 crisis - self harm, suicide, hopelessness (not immediate/no plan)
 confession - confessing something they did wrong, guilt over an action
 
-Rules:
-- Return at most 2 keys, comma-separated, most relevant first.
-- If nothing applies, or it's casual/general conversation, return exactly: NONE
-- Output ONLY the key(s) or NONE. No explanation, no extra text.
+Return at most 2 keys, comma-separated, most relevant first. If nothing applies, or it's casual/general conversation, use NONE.
+
+2. SCORE — rate ONLY the self-harm or suicide risk from 1-10. Assume the worst plausible interpretation for ambiguous messages.
+
+1-3 = Safe (general stress, sadness)
+4-6 = Distress (emotional pain, hopelessness)
+7-8 = Crisis (self harm or suicide mentioned)
+9-10 = Severe (immediate danger, has plan or means)
+
+"i bought a blade today" = 9 (means acquired)
+"kash main hoti hi nahi" = 8 (wishing non-existence)
+"i want to drink this bottle of poison" = 10
+"i feel sad" = 2
+
+Output EXACTLY two lines, nothing else, no explanation:
+TOPICS: <key(s) or NONE>
+SCORE: <number 1-10>
 
 Examples:
-"ugh exams are killing me this week" -> casual_stress
-"he cheated and i still miss him" -> relationship_issues,emotional_breakup
-"my dad hits me when he's drunk" -> domestic_violence
-"hey how's it going" -> NONE
+"ugh exams are killing me this week" ->
+TOPICS: casual_stress
+SCORE: 2
+
+"he cheated and i still miss him" ->
+TOPICS: relationship_issues,emotional_breakup
+SCORE: 3
+
+"my dad hits me when he's drunk" ->
+TOPICS: domestic_violence
+SCORE: 5
 """
 
+TOPICS_LINE_RE = re.compile(r'TOPICS:\s*(.*)', re.IGNORECASE)
+# Deliberately \d+ (not [1-9]|10) so an out-of-spec model output like
+# "SCORE: 15" still gets captured and clamped down to 10 below, instead of
+# failing to match and silently defaulting to score=1 ("safe"). Defaulting
+# to "safe" on a malformed *high* number would be the wrong fail-soft
+# direction for a crisis-scoring path.
+SCORE_LINE_RE = re.compile(r'SCORE:\s*(\d+)', re.IGNORECASE)
 
-async def classify_topic(message: str, http_client) -> list:
+
+async def classify_topic_and_score(message: str, http_client) -> dict:
     """
-    Async topic classifier. Returns a list of 0-2 topic keys (matching
-    TOPIC_PLAYBOOKS) relevant to the message. Fails safe to [] on any
-    error or unrecognized output — CORE_PROMPT alone is a safe fallback.
+    Merged async call: topic classification AND danger scoring in a single
+    Sarvam round-trip (see comment block above for why). Returns:
+        {"topics": [...0-2 keys from KNOWN_TOPICS...], "score": int 1-10}
+
+    Parsing is fail-soft PER FIELD, independently — a malformed/missing
+    TOPICS line and a malformed/missing SCORE line are handled separately,
+    so a bug in one can't silently take the other down with it. On total
+    failure (e.g. the network call itself errors), falls back to the same
+    safe defaults the two functions this replaces used: topics=[] and
+    score=1.
     """
     try:
         response = await http_client.post(
@@ -153,38 +198,63 @@ async def classify_topic(message: str, http_client) -> list:
             json={
                 "model": "sarvam-105b",
                 "messages": [
-                    {"role": "system", "content": TOPIC_CLASSIFIER_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Classify this message: {message}"}
+                    {"role": "system", "content": TOPIC_AND_SCORE_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Analyze this message: {message}"}
                 ],
-                # FIX BUG 2 (classify_topic): sarvam-30b has thinking mode ON by
-                # default. With max_tokens=30 the model spent its entire budget on
-                # reasoning tokens, leaving content empty and causing a KeyError on
-                # 'choices' (the API returns an error JSON instead of a normal
-                # response when no content is generated). Fix: disable thinking with
-                # reasoning_effort=None and raise max_tokens to 50 for safety.
-                "max_tokens": 50,
+                # Same thinking-mode trap as the old classify_topic/ai_danger_score
+                # calls (see their history) — reasoning_effort=None disables it
+                # entirely. max_tokens raised slightly over classify_topic's old 50
+                # to comfortably fit both output lines.
+                "max_tokens": 60,
                 "temperature": 0.1,
                 "reasoning_effort": None
             },
             timeout=8.0
         )
         data = response.json()
-        logger.info(f"[DEBUG] Sarvam classify_topic raw response: {data}")
+        logger.info(f"[DEBUG] Sarvam classify_topic_and_score raw response: {data}")
         msg = data["choices"][0]["message"]
         content = (msg.get("content") or "").strip()
         reasoning = (msg.get("reasoning_content") or "").strip()
         raw = content if content else reasoning
 
-        if not raw or raw.upper().startswith("NONE"):
-            return []
+        # --- TOPICS (fail-soft) ---
+        topics = []
+        try:
+            topics_match = TOPICS_LINE_RE.search(raw)
+            if topics_match:
+                topics_str = topics_match.group(1).strip()
+                if topics_str and not topics_str.upper().startswith("NONE"):
+                    keys = [k.strip() for k in topics_str.split(",")]
+                    topics = [k for k in keys if k in KNOWN_TOPICS][:2]
+        except Exception as e:
+            logger.warning(f"classify_topic_and_score: TOPICS parse failed, defaulting to []: {e}")
+            topics = []
 
-        keys = [k.strip() for k in raw.split(",")]
-        valid_keys = [k for k in keys if k in KNOWN_TOPICS]
-        return valid_keys[:2]
+        # --- SCORE (fail-soft) ---
+        score = 1
+        try:
+            score_match = SCORE_LINE_RE.search(raw)
+            if score_match:
+                score = max(1, min(10, int(score_match.group(1))))
+            else:
+                # Lenient fallback: same "find any number anywhere in the
+                # response" approach the old ai_danger_score used, in case the
+                # model didn't follow the exact "SCORE: N" format. \d+ (not a
+                # 1-10-only pattern) for the same out-of-spec-number reason
+                # noted on SCORE_LINE_RE above.
+                numbers = re.findall(r'\d+', raw)
+                if numbers:
+                    score = max(1, min(10, int(numbers[-1])))
+        except Exception as e:
+            logger.warning(f"classify_topic_and_score: SCORE parse failed, defaulting to 1: {e}")
+            score = 1
+
+        return {"topics": topics, "score": score}
 
     except Exception as e:
-        logger.error(f"Topic classifier failed, falling back to core prompt only: {e}", exc_info=True)
-        return []
+        logger.error(f"classify_topic_and_score failed entirely, falling back to safe defaults: {e}", exc_info=True)
+        return {"topics": [], "score": 1}
 
 
 def _build_dynamic_prompt(topics: list, user_profile: str, keyword_result: dict) -> str:
@@ -203,11 +273,11 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
     """
     Full pipeline:
     1. Block harmful requests immediately
-    2. Load user profile + memory + classify topic (concurrently)
-    3. Run reply generation and AI safety scoring CONCURRENTLY
-       (base system prompt already carries the crisis-pivot instructions,
-       so generation doesn't need to wait on the AI score first — the score
-       is used afterward to decide alerts/helplines/escalation)
+    2. Load user profile + memory + classify topic & score, all concurrently
+       (topic + AI danger score come from one merged Sarvam call — see
+       classify_topic_and_score — instead of two separate ones)
+    3. Generate the reply (score is already in hand from step 2, so nothing
+       needs to run concurrently with generation anymore)
     4. Handle alerts based on consent
     5. Save to memory (concurrently)
 
@@ -245,19 +315,23 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
     # Step 2 — Fast keyword safety layer runs first (instant, no network call)
     keyword_result = check_safety(user_message)
 
-    # Step 3 — Load profile + history + classify topic, all concurrently.
-    # Topic classification has to finish before we build the prompt (it
-    # decides what goes in the prompt), so it can't overlap with reply
-    # generation the way ai_danger_score does — instead it overlaps with
-    # the profile/memory fetch, which is already the slowest step.
+    # Step 3 — Load profile + history + classify topic & score, all
+    # concurrently. Topic classification has to finish before we build the
+    # prompt (it decides what goes in the prompt), so it can't overlap with
+    # reply generation — instead it overlaps with the profile/memory fetch,
+    # which is already the slowest step. The danger score now rides along
+    # in this same call (see classify_topic_and_score), so it no longer
+    # needs its own separate round-trip later.
     _t0 = time.perf_counter()
-    user_profile, raw_history, topics = await asyncio.gather(
+    user_profile, raw_history, classification = await asyncio.gather(
         load_user_profile(user_id, http_client),
         load_memory(user_id, http_client),
-        classify_topic(user_message, http_client),
+        classify_topic_and_score(user_message, http_client),
     )
-    logger.info(f"[TIMING] profile+memory+topic load: {time.perf_counter() - _t0:.2f}s")
+    logger.info(f"[TIMING] profile+memory+topic+score load: {time.perf_counter() - _t0:.2f}s")
     history = summarize_history(raw_history)
+    topics = classification["topics"]
+    ai_score = classification["score"]
 
     # Step 4 — Build system prompt: core + matched playbook(s) + profile +
     # the existing keyword-safety addendum. Crisis-pivot behavior lives in
@@ -268,20 +342,22 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
     messages += history
     messages.append({"role": "user", "content": user_message})
 
-    # Step 5 — Run reply generation and AI danger scoring CONCURRENTLY.
-    # If the keyword layer already flagged "severe", skip the AI scoring call
-    # entirely — it can't downgrade a severe result anyway.
+    # Step 5 — Generate the reply. The danger score was already computed in
+    # Step 3, so there's nothing left to run concurrently here anymore.
+    # If the keyword layer already flagged "severe", the score can't
+    # downgrade it — it's recorded on safety_result anyway (not used for
+    # the decision) purely for observability: it lets us later check
+    # whether keyword-flagged severe messages are ones the model would
+    # also score high, i.e. a calibration signal for tuning the keyword
+    # list, without ever letting the AI score soften a severe call.
     _t1 = time.perf_counter()
+    reply = await _get_ai_reply(http_client, messages)
     if keyword_result["level"] == "severe":
-        reply = await _get_ai_reply(http_client, messages)
         safety_result = keyword_result
+        safety_result["ai_score"] = ai_score
     else:
-        reply, ai_score = await asyncio.gather(
-            _get_ai_reply(http_client, messages),
-            ai_danger_score(user_message, http_client),
-        )
         safety_result = combine_keyword_and_ai_score(keyword_result, ai_score)
-    logger.info(f"[TIMING] reply+score: {time.perf_counter() - _t1:.2f}s")
+    logger.info(f"[TIMING] reply gen: {time.perf_counter() - _t1:.2f}s")
 
     # Step 6 — Append helplines if crisis or severe
     if safety_result["level"] == "severe":
@@ -383,15 +459,18 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
     # Step 2 — Fast keyword safety layer (instant, no network call)
     keyword_result = check_safety(user_message)
 
-    # Step 3 — Load profile + history + classify topic, all concurrently.
+    # Step 3 — Load profile + history + classify topic & score, all
+    # concurrently (same merged call as chat() — see classify_topic_and_score).
     _t0 = time.perf_counter()
-    user_profile, raw_history, topics = await asyncio.gather(
+    user_profile, raw_history, classification = await asyncio.gather(
         load_user_profile(user_id, http_client),
         load_memory(user_id, http_client),
-        classify_topic(user_message, http_client),
+        classify_topic_and_score(user_message, http_client),
     )
-    logger.info(f"[TIMING] chat_stream profile+memory+topic load: {time.perf_counter() - _t0:.2f}s")
+    logger.info(f"[TIMING] chat_stream profile+memory+topic+score load: {time.perf_counter() - _t0:.2f}s")
     history = summarize_history(raw_history)
+    topics = classification["topics"]
+    ai_score = classification["score"]
 
     # Step 4 — Build system prompt: core + matched playbook(s) + profile +
     # keyword-safety addendum.
@@ -450,13 +529,13 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
 
     logger.info(f"[TIMING] chat_stream SSE reply: {time.perf_counter() - _t1:.2f}s")
 
-    # Step 6 — Resolve safety score exactly as chat() does.
-    # If keyword layer already flagged "severe", skip AI scoring — it can't
-    # downgrade a severe result anyway.
+    # Step 6 — Resolve safety score exactly as chat() does. The AI score was
+    # already computed back in Step 3 (merged with topic classification), so
+    # this is just combining it now — no extra network call after the stream.
     if keyword_result["level"] == "severe":
         safety_result = keyword_result
+        safety_result["ai_score"] = ai_score  # logged for observability only; never affects the decision
     else:
-        ai_score = await ai_danger_score(user_message, http_client)
         safety_result = combine_keyword_and_ai_score(keyword_result, ai_score)
 
     # Step 7 — Decide whether to send alerts. Guardian email is a blocking
