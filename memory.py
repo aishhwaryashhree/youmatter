@@ -1,78 +1,95 @@
-import requests
+BACKEND_DISABLED = True  # Flip to False once new backend is ready
+import logging
 
-# Your backend base URL 
+logger = logging.getLogger("youmatter.memory")
+
+# Your backend base URL
 BACKEND_URL = "https://you-matter-backend.onrender.com/api/v1"
 
-def load_memory(user_id: str) -> list:
+
+async def load_memory(user_id: str, http_client) -> list:
     """
     Fetches past conversation history from backend.
     Returns it in the format the AI expects.
+    http_client is a shared httpx.AsyncClient passed in from the request layer.
     """
+    if BACKEND_DISABLED:
+        return []
     try:
-        response = requests.get(f"{BACKEND_URL}/api/conversation/{user_id}")
+        response = await http_client.get(
+            f"{BACKEND_URL}/api/conversation/{user_id}", timeout=5.0
+        )
         if response.status_code == 200:
             messages = response.json()
-            # Convert to OpenAI format
-            history = []
-            for msg in messages:
-                history.append({
-                    "role": msg["role"],
-                    "content": msg["message"]
-                })
-            return history
-        else:
-            return []
+            return [
+                {"role": msg["role"], "content": msg["message"]}
+                for msg in messages
+            ]
+        logger.warning(
+            f"load_memory: backend returned {response.status_code} for user {user_id}"
+        )
+        return []
     except Exception as e:
-        print(f"Memory load failed: {e}")
+        logger.error(f"load_memory failed for user {user_id}: {e}", exc_info=True)
         return []
 
 
-def save_message(user_id: str, role: str, message: str, token: str = ""):
+async def save_message(user_id: str, role: str, message: str, http_client, token: str = ""):
+    if BACKEND_DISABLED:
+        return
     try:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
-        requests.post(f"{BACKEND_URL}/message", json={
-            "message": message,
-            "sender": role
-        }, headers=headers)
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        response = await http_client.post(
+            f"{BACKEND_URL}/message",
+            json={"message": message, "sender": role},
+            headers=headers,
+            timeout=5.0
+        )
+        if response.status_code >= 400:
+            logger.warning(
+                f"save_message: backend returned {response.status_code} for user {user_id}"
+            )
     except Exception as e:
-        print(f"Memory save failed: {e}")
+        logger.error(f"save_message failed for user {user_id}: {e}", exc_info=True)
 
-
-def load_user_profile(user_id: str) -> str:
+async def load_user_profile(user_id: str, http_client) -> str:
     """
     Fetches user profile from backend.
     Returns a summary string to inject into AI context.
     """
+    if BACKEND_DISABLED:
+        return ""
     try:
-        response = requests.get(f"{BACKEND_URL}/api/user/{user_id}")
+        response = await http_client.get(
+            f"{BACKEND_URL}/api/user/{user_id}", timeout=5.0
+        )
         if response.status_code == 200:
             user = response.json()
-            profile = f"""
+            return f"""
 User Profile:
 - Name: {user.get('name', 'Unknown')}
 - Age: {user.get('age', 'Unknown')}
 - Current concerns: {user.get('current_concerns', 'Not shared')}
 - Medical history: {user.get('medical_history', 'Not shared')}
 """
-            return profile
-        else:
-            return ""
+        logger.warning(
+            f"load_user_profile: backend returned {response.status_code} for user {user_id}"
+        )
+        return ""
     except Exception as e:
-        print(f"Profile load failed: {e}")
+        logger.error(f"load_user_profile failed for user {user_id}: {e}", exc_info=True)
         return ""
 
 
-def summarize_history(history: list) -> str:
+def summarize_history(history: list, keep_last: int = 20) -> list:
     """
-    If history is too long, summarize older messages
-    to save token space. Keep last 20 messages full.
+    Trims history to the last `keep_last` messages.
+    NOTE: this is truncation, not summarization — older context is dropped
+    rather than condensed. True summarization (e.g. periodically compressing
+    older turns into a short synopsis) is a follow-up improvement, not done here.
     """
-    if len(history) <= 20:
+    if len(history) <= keep_last:
         return history
-
-    # Keep only last 20 messages
-    # Older ones will be summarized later when we add AI summarization
-    return history[-20:]
+    return history[-keep_last:]
