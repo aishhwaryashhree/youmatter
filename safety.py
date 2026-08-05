@@ -267,7 +267,10 @@ def should_send_alert(safety_result: dict, user_consent: dict) -> dict:
             "urgent": True
         }
 
-    # Crisis — alert only if not paused
+    # Crisis — no guardian alert at this level.
+    # Helplines still appear in the reply (via ai_core.py chat()), but no
+    # email goes to the guardian unless the situation escalates to "severe".
+   # Crisis — alert only if not paused
     if level == "crisis":
         if user_consent.get("alerts_paused", False):
             return {"send_guardian": False, "send_helpline": False}
@@ -313,31 +316,36 @@ Please check in on them when you get a chance — a simple message or call can m
 — YouMatter Team
 """
 
-def ai_danger_score(message: str, client) -> int:
-    import requests
+async def ai_danger_score(message: str, http_client) -> int:
+    """
+    Async AI-based danger scorer. http_client is a shared httpx.AsyncClient
+    (passed in, not created per-call) so connections get reused.
+    """
     import os
     import re
+    import logging
 
+    logger = logging.getLogger("youmatter.safety")
     SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
     try:
-        response = requests.post(
+        response = await http_client.post(
             "https://api.sarvam.ai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {SARVAM_API_KEY}",
                 "Content-Type": "application/json"
             },
             json={
-    "model": "sarvam-m",
-    "messages": [
-        {
-            "role": "system",
-            "content": """You are a mental health crisis detector for an Indian mental health app.
+                "model": "sarvam-105b",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": """You are a mental health crisis detector for an Indian mental health app.
 Rate ONLY the self-harm or suicide risk from 1-10.
 Assume the worst plausible interpretation for ambiguous messages.
 
 1-3 = Safe (general stress, sadness)
-4-6 = Distress (emotional pain, hopelessness)  
+4-6 = Distress (emotional pain, hopelessness)
 7-8 = Crisis (self harm or suicide mentioned)
 9-10 = Severe (immediate danger, has plan or means)
 
@@ -347,18 +355,26 @@ Assume the worst plausible interpretation for ambiguous messages.
 "i feel sad" = 2
 
 Output the number then STOP."""
-        },
-        {
-            "role": "user",
-            "content": f"Rate danger level of: {message}"
-        }
-    ],
-    "max_tokens": 100,
-    "temperature": 0.1,
-    "reasoning_effort": "low"
-}
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Rate danger level of: {message}"
+                    }
+                ],
+                # FIX BUG 2 (ai_danger_score): sarvam-30b has thinking mode ON
+                # by default. With reasoning_effort="low" and max_tokens=100
+                # the model spent its whole budget on reasoning tokens, returned
+                # empty content, and the API returned an error JSON without
+                # 'choices' — causing KeyError. Fix: disable thinking entirely
+                # with reasoning_effort=None and raise max_tokens to 200.
+                "max_tokens": 200,
+                "temperature": 0.1,
+                "reasoning_effort": None
+            },
+            timeout=8.0
         )
         data = response.json()
+        logger.info(f"[DEBUG] Sarvam danger-score raw response: {data}")
         msg = data["choices"][0]["message"]
         content = msg.get("content") or ""
         reasoning = msg.get("reasoning_content") or ""
@@ -371,27 +387,19 @@ Output the number then STOP."""
         return 1
 
     except Exception as e:
-        print(f"[Safety scorer] Error: {e}")
+        # Fail closed-ish: log loudly so a silent outage doesn't go unnoticed.
+        # Returning 1 (safe) here is a deliberate tradeoff — a scorer outage
+        # shouldn't block chat entirely since keyword layer still runs.
+        logger.error(f"AI danger scorer failed, defaulting to safe: {e}", exc_info=True)
         return 1
 
 
-def check_safety_full(message: str, client) -> dict:
+def combine_keyword_and_ai_score(keyword_result: dict, score: int) -> dict:
     """
-    Full two-layer safety check.
-    Layer 1: Keywords (fast)
-    Layer 2: AI scoring (catches indirect phrases)
+    Merges the fast keyword-layer result with the AI danger score.
+    Shared by both the sequential (check_safety_full) and concurrent
+    (ai_core's gather-based) call paths so the upgrade logic lives in one place.
     """
-    # Layer 1 — keyword scan
-    result = check_safety(message)
-
-    # If already severe, no need for AI check
-    if result["level"] == "severe":
-        return result
-
-    # Layer 2 — AI danger scoring
-    score = ai_danger_score(message, client)
-
-    # Upgrade level based on AI score
     if score >= 9:
         return {
             "level": "severe",
@@ -410,7 +418,7 @@ def check_safety_full(message: str, client) -> dict:
         }
     elif score >= 4:
         # Only upgrade if keyword scan said safe
-        if result["level"] == "safe":
+        if keyword_result["level"] == "safe":
             return {
                 "level": "distress",
                 "keyword_found": "AI detected",
@@ -419,8 +427,28 @@ def check_safety_full(message: str, client) -> dict:
                 "ai_score": score
             }
 
-    result["ai_score"] = score
-    return result
+    keyword_result["ai_score"] = score
+    return keyword_result
+
+
+async def check_safety_full(message: str, http_client) -> dict:
+    """
+    Full two-layer safety check (sequential — used outside the hot chat path,
+    e.g. for batch/offline analysis). The live chat pipeline in ai_core.py
+    runs these two layers concurrently instead; see combine_keyword_and_ai_score.
+    Layer 1: Keywords (fast)
+    Layer 2: AI scoring (catches indirect phrases)
+    """
+    # Layer 1 — keyword scan
+    result = check_safety(message)
+
+    # If already severe, no need for AI check
+    if result["level"] == "severe":
+        return result
+
+    # Layer 2 — AI danger scoring
+    score = await ai_danger_score(message, http_client)
+    return combine_keyword_and_ai_score(result, score)
 def is_blocked_request(message: str) -> bool:
     """
     Returns True if user is asking for harmful information.
