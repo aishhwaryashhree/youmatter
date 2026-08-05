@@ -1,30 +1,62 @@
-import boto3
-from botocore.exceptions import ClientError
 import os
+import smtplib
+import logging
+from email.mime.text import MIMEText
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# AWS SES client
-ses_client = boto3.client(
-    'ses',
-    region_name=os.getenv('AWS_SES_REGION', 'us-east-1'),
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-)
+logger = logging.getLogger("youmatter.email")
 
-YOUMATTER_EMAIL = os.getenv('YOUMATTER_EMAIL')
+# SMTP config — works with Gmail (using an App Password, not your normal
+# password) or any other email provider that offers SMTP access.
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")  # your sending email address
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")  # app password, not your login password
+YOUMATTER_EMAIL = os.getenv("YOUMATTER_EMAIL", SMTP_USERNAME)
 
 
-def send_guardian_alert(guardian_email: str, user_name: str, urgent: bool = False):
+def _send_email(to_email: str, subject: str, body: str) -> bool:
+    """Sends a plain-text email over SMTP. Returns True on success."""
+    if not to_email:
+        logger.warning("_send_email: no recipient provided, skipping send")
+        return False
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        logger.error("_send_email: SMTP_USERNAME/SMTP_PASSWORD not configured")
+        return False
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = YOUMATTER_EMAIL
+    msg["To"] = to_email
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(YOUMATTER_EMAIL, [to_email], msg.as_string())
+        logger.info(f"Email sent to {to_email}")
+        return True
+    except Exception as e:
+        logger.error(f"Email send failed to {to_email}: {e}", exc_info=True)
+        return False
+
+
+def send_guardian_alert(guardian_email, user_name: str, urgent: bool = False) -> bool:
     """
     Sends email to guardian when crisis is detected.
     Vague for crisis, urgent for severe.
     """
+    if isinstance(guardian_email, list):
+        to_email = guardian_email[0] if guardian_email else None
+    else:
+        to_email = guardian_email
+
     if urgent:
         subject = f"URGENT — {user_name} may need immediate help"
-        body = f"""
-Hello,
+        body = f"""Hello,
 
 This is an urgent message from YouMatter, an AI mental health companion.
 
@@ -33,11 +65,10 @@ We are concerned that {user_name} may be in immediate danger right now.
 Please reach out to them immediately or call emergency services (112) if needed.
 
 — YouMatter Safety Team
-        """
+"""
     else:
         subject = f"Checking in on {user_name}"
-        body = f"""
-Hello,
+        body = f"""Hello,
 
 This is a gentle message from YouMatter, an AI mental health companion.
 
@@ -45,64 +76,18 @@ This is a gentle message from YouMatter, an AI mental health companion.
 Please check in on them when you get a chance — a simple message or call can mean the world.
 
 — YouMatter Team
-        """
+"""
 
-    try:
-# Sandbox routing — remove after SES production access
-        if user_name == "Harshita Smriti":
-            to_email = "aishwaryashree15@gmail.com"
-        elif user_name == "Aishwarya Shree":
-            to_email = "harshitasmriti@gmail.com"
-        else:
-            if isinstance(guardian_email, list):
-                to_email = guardian_email[0]
-            else:
-                to_email = guardian_email
-
-        response = ses_client.send_email(
-            Source=YOUMATTER_EMAIL,
-            Destination={
-                'ToAddresses': [to_email]
-            },
-            Message={
-                'Subject': {
-                    'Data': subject,
-                    'Charset': 'UTF-8'
-                },
-                'Body': {
-                    'Text': {
-                        'Data': body,
-                        'Charset': 'UTF-8'
-                    }
-                }
-            }
-        )
-        print(f"Email sent to {guardian_email}: {response['MessageId']}")
-        return True
-    except ClientError as e:
-        print(f"Email failed: {e.response['Error']['Message']}")
-        return False
+    return _send_email(to_email, subject, body)
 
 
-def send_helpline_alert(user_name: str):
+def send_helpline_alert(user_name: str) -> bool:
     """
-    Sends alert to helpline email for severe crisis.
+    Sends alert to YouMatter's own inbox for severe crisis, so the team
+    (or you, during dev/testing) sees it and can follow up.
     """
-    try:
-        response = ses_client.send_email(
-            Source=YOUMATTER_EMAIL,
-            Destination={
-                'ToAddresses': [YOUMATTER_EMAIL]  # Send to ourselves for now
-            },
-            Message={
-                'Subject': {
-                    'Data': f"SEVERE CRISIS ALERT — {user_name}",
-                    'Charset': 'UTF-8'
-                },
-                'Body': {
-                    'Text': {
-                        'Data': f"""
-SEVERE CRISIS DETECTED
+    subject = f"SEVERE CRISIS ALERT — {user_name}"
+    body = f"""SEVERE CRISIS DETECTED
 
 User {user_name} has shown signs of immediate danger.
 
@@ -111,24 +96,19 @@ This alert was automatically generated by YouMatter AI Safety System.
 Please follow up immediately.
 
 — YouMatter Safety System
-                        """,
-                        'Charset': 'UTF-8'
-                    }
-                }
-            }
-        )
-        print(f"Helpline alert sent: {response['MessageId']}")
-        return True
-    except ClientError as e:
-        print(f"Helpline alert failed: {e.response['Error']['Message']}")
-        return False
+"""
+    return _send_email(YOUMATTER_EMAIL, subject, body)
 
 
-# Test
+# Test — set TEST_GUARDIAN_EMAIL in your .env before running this file directly
 if __name__ == "__main__":
-    result = send_guardian_alert(
-        guardian_email="aishwaryashree15@gmail.com",
-        user_name="Aishwarya",
-        urgent=False
-    )
-    print(f"Email sent: {result}")
+    test_email = os.getenv("TEST_GUARDIAN_EMAIL")
+    if not test_email:
+        print("Set TEST_GUARDIAN_EMAIL in your .env to test this file directly.")
+    else:
+        result = send_guardian_alert(
+            guardian_email=test_email,
+            user_name="Test User",
+            urgent=False
+        )
+        print(f"Email sent: {result}")
