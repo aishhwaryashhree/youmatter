@@ -5,6 +5,7 @@ import os
 import asyncio
 import logging
 import time
+from aiolimiter import AsyncLimiter
 from email_service import send_guardian_alert, send_helpline_alert
 from dotenv import load_dotenv
 from safety import (
@@ -45,7 +46,7 @@ def _clean_reply(raw_reply: str) -> str:
     return reply
 
 
-async def _get_ai_reply(http_client, messages: list) -> str:
+async def _get_ai_reply(http_client, sarvam_limiter, messages: list) -> str:
     """Calls Sarvam for the actual companion reply. Async + timeout so a slow
     upstream call can't block the whole event loop.
     The entire body is wrapped in try/except so any network failure or API
@@ -63,7 +64,8 @@ async def _get_ai_reply(http_client, messages: list) -> str:
             "Authorization": f"Bearer {SARVAM_API_KEY}",
             "Content-Type": "application/json"
         }
-        response = await http_client.post(SARVAM_URL, json=payload, headers=headers, timeout=25.0)
+        async with sarvam_limiter:
+            response = await http_client.post(SARVAM_URL, json=payload, headers=headers, timeout=25.0)
         response_data = response.json()
         logger.info(f"[DEBUG] Sarvam _get_ai_reply raw response: {response_data}")
         raw_reply = response_data["choices"][0]["message"]["content"]
@@ -175,7 +177,7 @@ TOPICS_LINE_RE = re.compile(r'TOPICS:\s*(.*)', re.IGNORECASE)
 SCORE_LINE_RE = re.compile(r'SCORE:\s*(\d+)', re.IGNORECASE)
 
 
-async def classify_topic_and_score(message: str, http_client) -> dict:
+async def classify_topic_and_score(message: str, http_client, sarvam_limiter) -> dict:
     """
     Merged async call: topic classification AND danger scoring in a single
     Sarvam round-trip (see comment block above for why). Returns:
@@ -189,28 +191,29 @@ async def classify_topic_and_score(message: str, http_client) -> dict:
     score=1.
     """
     try:
-        response = await http_client.post(
-            SARVAM_URL,
-            headers={
-                "Authorization": f"Bearer {SARVAM_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "sarvam-105b",
-                "messages": [
-                    {"role": "system", "content": TOPIC_AND_SCORE_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Analyze this message: {message}"}
-                ],
-                # Same thinking-mode trap as the old classify_topic/ai_danger_score
-                # calls (see their history) — reasoning_effort=None disables it
-                # entirely. max_tokens raised slightly over classify_topic's old 50
-                # to comfortably fit both output lines.
-                "max_tokens": 60,
-                "temperature": 0.1,
-                "reasoning_effort": None
-            },
-            timeout=8.0
-        )
+        async with sarvam_limiter:
+            response = await http_client.post(
+                SARVAM_URL,
+                headers={
+                    "Authorization": f"Bearer {SARVAM_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "sarvam-105b",
+                    "messages": [
+                        {"role": "system", "content": TOPIC_AND_SCORE_SYSTEM_PROMPT},
+                        {"role": "user", "content": f"Analyze this message: {message}"}
+                    ],
+                    # Same thinking-mode trap as the old classify_topic/ai_danger_score
+                    # calls (see their history) — reasoning_effort=None disables it
+                    # entirely. max_tokens raised slightly over classify_topic's old 50
+                    # to comfortably fit both output lines.
+                    "max_tokens": 60,
+                    "temperature": 0.1,
+                    "reasoning_effort": None
+                },
+                timeout=8.0
+            )
         data = response.json()
         logger.info(f"[DEBUG] Sarvam classify_topic_and_score raw response: {data}")
         msg = data["choices"][0]["message"]
@@ -269,7 +272,7 @@ def _build_dynamic_prompt(topics: list, user_profile: str, keyword_result: dict)
     return dynamic_prompt
 
 
-async def chat(user_id: str, user_message: str, http_client, user_consent: dict = None):
+async def chat(user_id: str, user_message: str, http_client, sarvam_limiter, user_consent: dict = None):
     """
     Full pipeline:
     1. Block harmful requests immediately
@@ -283,6 +286,9 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
 
     http_client: a shared httpx.AsyncClient, created once per app lifetime
     and passed in (not created per-request) so connections get reused.
+    sarvam_limiter: a shared AsyncLimiter(40, 60) that gates all outgoing
+    Sarvam calls globally. Each message consumes 2 slots (classify +
+    reply), so real throughput is ~20 messages/minute across all users.
     """
 
     if user_consent is None:
@@ -326,7 +332,7 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
     user_profile, raw_history, classification = await asyncio.gather(
         load_user_profile(user_id, http_client),
         load_memory(user_id, http_client),
-        classify_topic_and_score(user_message, http_client),
+        classify_topic_and_score(user_message, http_client, sarvam_limiter),
     )
     logger.info(f"[TIMING] profile+memory+topic+score load: {time.perf_counter() - _t0:.2f}s")
     history = summarize_history(raw_history)
@@ -351,7 +357,7 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
     # also score high, i.e. a calibration signal for tuning the keyword
     # list, without ever letting the AI score soften a severe call.
     _t1 = time.perf_counter()
-    reply = await _get_ai_reply(http_client, messages)
+    reply = await _get_ai_reply(http_client, sarvam_limiter, messages)
     if keyword_result["level"] == "severe":
         safety_result = keyword_result
         safety_result["ai_score"] = ai_score
@@ -412,7 +418,7 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
     }
 
 
-async def chat_stream(user_id: str, user_message: str, http_client, user_consent: dict = None):
+async def chat_stream(user_id: str, user_message: str, http_client, sarvam_limiter, user_consent: dict = None):
     """
     Streaming variant of chat(). Same full pipeline (blocked-request check,
     keyword safety, profile/memory/topic load, prompt build, alerts, memory
@@ -425,6 +431,8 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
 
     The existing chat() function is NOT modified — this is an additive,
     independent function that reuses the same helpers.
+    sarvam_limiter: same shared AsyncLimiter passed through from app.state;
+    the streaming call holds its slot for the entire SSE connection duration.
     """
 
     if user_consent is None:
@@ -465,7 +473,7 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
     user_profile, raw_history, classification = await asyncio.gather(
         load_user_profile(user_id, http_client),
         load_memory(user_id, http_client),
-        classify_topic_and_score(user_message, http_client),
+        classify_topic_and_score(user_message, http_client, sarvam_limiter),
     )
     logger.info(f"[TIMING] chat_stream profile+memory+topic+score load: {time.perf_counter() - _t0:.2f}s")
     history = summarize_history(raw_history)
@@ -500,23 +508,27 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
 
     _t1 = time.perf_counter()
     try:
-        async with http_client.stream("POST", SARVAM_URL, json=payload, headers=headers, timeout=25.0) as response:
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[len("data: "):]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    piece = (chunk["choices"][0]["delta"].get("content") or "")
-                    if piece:
-                        full_reply += piece
-                        yield {"type": "token", "content": piece}
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    # Malformed or unexpected chunk — skip silently and continue
-                    logger.warning(f"chat_stream: skipping unparseable SSE chunk: {data_str!r}")
-                    continue
+        # The sarvam_limiter slot is held for the full duration of the SSE
+        # stream — this is intentional, since the connection to Sarvam is open
+        # and actively consuming their capacity until the stream ends.
+        async with sarvam_limiter:
+            async with http_client.stream("POST", SARVAM_URL, json=payload, headers=headers, timeout=25.0) as response:
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[len("data: "):]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        piece = (chunk["choices"][0]["delta"].get("content") or "")
+                        if piece:
+                            full_reply += piece
+                            yield {"type": "token", "content": piece}
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        # Malformed or unexpected chunk — skip silently and continue
+                        logger.warning(f"chat_stream: skipping unparseable SSE chunk: {data_str!r}")
+                        continue
     except Exception as e:
         logger.error(f"chat_stream SSE failed ({type(e).__name__}): {e}", exc_info=True)
         fallback = (
@@ -611,12 +623,14 @@ async def _interactive_main():
     }
 
     async with httpx.AsyncClient() as http_client:
+        # Standalone dev limiter — same cap as the app; safe to run locally.
+        dev_limiter = AsyncLimiter(40, 60)
         while True:
             user_input = input("You: ")
             if user_input.lower() == "quit":
                 break
 
-            result = await chat(user_id, user_input, http_client, test_consent)
+            result = await chat(user_id, user_input, http_client, dev_limiter, test_consent)
 
             level = result["safety_level"]
             if level == "severe":
