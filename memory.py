@@ -43,7 +43,7 @@ async def save_message(user_id: str, role: str, message: str, http_client, token
             headers["Authorization"] = f"Bearer {token}"
         response = await http_client.post(
             f"{BACKEND_URL}/message",
-            json={"message": message, "sender": role},
+            json={"message": message, "role": role},
             headers=headers,
             timeout=5.0
         )
