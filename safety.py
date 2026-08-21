@@ -48,6 +48,19 @@ HELPLINES = """
 - iCall Chat: icallhelpline.org
 """
 
+# ---------------------------------------------------------------------------
+# Shared danger-score thresholds.
+#
+# These are the ONLY place the numeric escalation boundaries live.
+# combine_keyword_and_ai_score() reads them here, and ai_core.py imports
+# CRISIS_SCORE_THRESHOLD for the domain-filter bypass condition — so the
+# domain filter and the real crisis pipeline can never drift out of sync.
+# ---------------------------------------------------------------------------
+
+# Minimum ai_score that triggers at least a distress-level response.
+# At this boundary the AI has detected emotional pain / hopelessness.
+CRISIS_SCORE_THRESHOLD = 4   # score >= 4 → distress, >= 7 → crisis, >= 9 → severe
+
 SEVERE_KEYWORDS = [
     # Direct statements
     "i have a plan", "i've decided to", "saying goodbye",
@@ -399,6 +412,11 @@ def combine_keyword_and_ai_score(keyword_result: dict, score: int) -> dict:
     Merges the fast keyword-layer result with the AI danger score.
     Shared by both the sequential (check_safety_full) and concurrent
     (ai_core's gather-based) call paths so the upgrade logic lives in one place.
+
+    Escalation boundaries (all sourced from CRISIS_SCORE_THRESHOLD above):
+      score >= 9                         -> severe
+      score >= 7                         -> crisis
+      score >= CRISIS_SCORE_THRESHOLD(4) -> distress (if keyword layer said safe)
     """
     if score >= 9:
         return {
@@ -416,7 +434,7 @@ def combine_keyword_and_ai_score(keyword_result: dict, score: int) -> dict:
             "can_pause": True,
             "ai_score": score
         }
-    elif score >= 4:
+    elif score >= CRISIS_SCORE_THRESHOLD:
         # Only upgrade if keyword scan said safe
         if keyword_result["level"] == "safe":
             return {
