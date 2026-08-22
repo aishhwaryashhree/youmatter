@@ -1,3 +1,4 @@
+import httpx
 from safety import combine_keyword_and_ai_score
 import re
 import json
@@ -23,6 +24,16 @@ from prompts import CORE_PROMPT, TOPIC_PLAYBOOKS, KNOWN_TOPICS
 from rate_limiter import per_user_rate_limiter, PerUserRateLimitExceeded, sarvam_rate_limiter
 
 load_dotenv()
+
+# Latency & resilience constants
+MAX_COMPANION_TOKENS = 250
+PRIMARY_TIMEOUT = 15.0
+RETRY_TIMEOUT = 12.0
+FALLBACK_CRISIS_MESSAGE = (
+    "I'm having trouble responding right now, but I don't want to leave you "
+    "without a reply. If you're in crisis, please reach out: "
+    "iCall 9152987821 or Vandrevala Foundation 1860-2662-345 (24/7)."
+)
 
 # Domain-relevance filter toggle.
 # Set ENABLE_DOMAIN_FILTER=false in .env to disable without touching code.
@@ -56,23 +67,50 @@ def _clean_reply(raw_reply: str) -> str:
 async def _get_ai_reply(http_client, messages: list, bypass_rate_limit: bool = False) -> str:
     """Calls Sarvam for the actual companion reply. Async + timeout so a slow
     upstream call can't block the whole event loop.
-    The entire body is wrapped in try/except so any network failure or API
-    error returns a safe fallback — this function must never crash, especially
+    Includes a single automatic retry on timeout with a shorter timeout (12s).
+    Wrapped in try/except so any network failure or API error returns a safe
+    fallback crisis message — this function must never crash, especially
     during crisis-level conversations."""
+    t_start = time.perf_counter()
     try:
         payload = {
             "model": "sarvam-105b",
             "messages": messages,
-            "max_tokens": 500,
+            "max_tokens": MAX_COMPANION_TOKENS,
             "temperature": 0.7,
-            "reasoning_effort": None
+            "reasoning_effort": None,
         }
         headers = {
             "Authorization": f"Bearer {SARVAM_API_KEY}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
         await sarvam_rate_limiter.acquire(bypass=bypass_rate_limit)
-        response = await http_client.post(SARVAM_URL, json=payload, headers=headers, timeout=25.0)
+        t_pre = time.perf_counter() - t_start
+
+        response = None
+        net_duration = 0.0
+
+        try:
+            t_net_start = time.perf_counter()
+            response = await http_client.post(SARVAM_URL, json=payload, headers=headers, timeout=PRIMARY_TIMEOUT)
+            net_duration = time.perf_counter() - t_net_start
+        except (httpx.TimeoutException, asyncio.TimeoutError) as te:
+            logger.warning(
+                f"[RETRY] Sarvam timeout on primary attempt ({type(te).__name__}: {te}), "
+                f"retrying once with {RETRY_TIMEOUT}s timeout..."
+            )
+            try:
+                t_net_start = time.perf_counter()
+                response = await http_client.post(SARVAM_URL, json=payload, headers=headers, timeout=RETRY_TIMEOUT)
+                net_duration += time.perf_counter() - t_net_start
+            except Exception as retry_err:
+                logger.error(f"_get_ai_reply retry failed ({type(retry_err).__name__}): {retry_err}", exc_info=True)
+                return FALLBACK_CRISIS_MESSAGE
+
+        if response is None:
+            return FALLBACK_CRISIS_MESSAGE
+
+        t_post_start = time.perf_counter()
         response_data = response.json()
         logger.info(f"[DEBUG] Sarvam _get_ai_reply raw response: {response_data}")
         raw_reply = response_data["choices"][0]["message"]["content"]
@@ -80,14 +118,20 @@ async def _get_ai_reply(http_client, messages: list, bypass_rate_limit: bool = F
             finish_reason = response_data["choices"][0].get("finish_reason")
             logger.error(f"Sarvam returned empty content, finish_reason={finish_reason}")
             return "Hey, I'm having a little trouble finding the right words right now — can you tell me a bit more about what's going on?"
-        return _clean_reply(raw_reply)
+        clean = _clean_reply(raw_reply)
+        t_end = time.perf_counter()
+        post_duration = t_end - t_post_start
+        total_duration = t_end - t_start
+
+        logger.info(
+            f"[TIMING] _get_ai_reply: total={total_duration:.2f}s | "
+            f"Sarvam network={net_duration:.2f}s | pre/post processing={(total_duration - net_duration):.2f}s "
+            f"(pre={t_pre:.2f}s, post={post_duration:.2f}s)"
+        )
+        return clean
     except Exception as e:
         logger.error(f"_get_ai_reply failed ({type(e).__name__}): {e}", exc_info=True)
-        return (
-            "I'm having trouble responding right now, but I don't want to leave you "
-            "without a reply. If you're in crisis, please reach out: "
-            "iCall 9152987821 or Vandrevala Foundation 1860-2662-345 (24/7)."
-        )
+        return FALLBACK_CRISIS_MESSAGE
 
 
 # ---------------------------------------------------------------------------
@@ -778,11 +822,13 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
     # full_reply is initialised HERE (before try/except) so the except branch
     # can safely assign the fallback without any risk of NameError.
     full_reply = ""
+    tokens_yielded = 0
+    t_first_token = None
 
     payload = {
         "model": "sarvam-105b",
         "messages": messages,
-        "max_tokens": 500,
+        "max_tokens": MAX_COMPANION_TOKENS,
         "temperature": 0.7,
         "reasoning_effort": None,
         "stream": True,
@@ -795,34 +841,57 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
     _t1 = time.perf_counter()
     try:
         await sarvam_rate_limiter.acquire(bypass=(safety_result["level"] in ("crisis", "severe")))
-        async with http_client.stream("POST", SARVAM_URL, json=payload, headers=headers, timeout=25.0) as response:
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[len("data: "):]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    piece = (chunk["choices"][0]["delta"].get("content") or "")
-                    if piece:
-                        full_reply += piece
-                        yield {"type": "token", "content": piece}
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    # Malformed or unexpected chunk — skip silently and continue
-                    logger.warning(f"chat_stream: skipping unparseable SSE chunk: {data_str!r}")
-                    continue
+
+        async def _stream_sarvam(timeout_val: float):
+            nonlocal full_reply, tokens_yielded, t_first_token
+            async with http_client.stream("POST", SARVAM_URL, json=payload, headers=headers, timeout=timeout_val) as response:
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[len("data: "):]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        piece = (chunk["choices"][0]["delta"].get("content") or "")
+                        if piece:
+                            if t_first_token is None:
+                                t_first_token = time.perf_counter()
+                            full_reply += piece
+                            tokens_yielded += 1
+                            yield {"type": "token", "content": piece}
+                    except json.JSONDecodeError:
+                        logger.debug(f"chat_stream: skipping non-JSON SSE chunk: {data_str!r}")
+                        continue
+                    except (KeyError, IndexError):
+                        # Normal end-of-stream chunk that contains only usage data
+                        # (no 'choices' or empty choices list) — not a parse error.
+                        logger.debug(f"chat_stream: skipping usage-only SSE chunk: {data_str!r}")
+                        continue
+
+        try:
+            async for evt in _stream_sarvam(PRIMARY_TIMEOUT):
+                yield evt
+        except (httpx.TimeoutException, asyncio.TimeoutError) as te:
+            if tokens_yielded == 0:
+                logger.warning(
+                    f"[RETRY] Sarvam stream timeout ({type(te).__name__}: {te}), "
+                    f"retrying once with {RETRY_TIMEOUT}s timeout..."
+                )
+                async for evt in _stream_sarvam(RETRY_TIMEOUT):
+                    yield evt
+            else:
+                raise te
+
     except Exception as e:
         logger.error(f"chat_stream SSE failed ({type(e).__name__}): {e}", exc_info=True)
-        fallback = (
-            "I'm having trouble responding right now, but I don't want to leave you "
-            "without a reply. If you're in crisis, please reach out: "
-            "iCall 9152987821 or Vandrevala Foundation 1860-2662-345 (24/7)."
-        )
+        fallback = FALLBACK_CRISIS_MESSAGE
         full_reply = fallback
         yield {"type": "token", "content": fallback}
 
-    logger.info(f"[TIMING] chat_stream SSE reply: {time.perf_counter() - _t1:.2f}s")
+    t_stream_end = time.perf_counter()
+    ttft_str = f" | TTFT={t_first_token - _t1:.2f}s" if t_first_token else ""
+    logger.info(f"[TIMING] chat_stream SSE reply: {t_stream_end - _t1:.2f}s (tokens={tokens_yielded}{ttft_str})")
 
     # Step 6 — safety_result was already computed above (before the stream),
     # so this comment is left as a marker; no computation needed here.
@@ -881,6 +950,34 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
 async def _interactive_main():
     import httpx
 
+    # ── Logging setup for interactive mode ───────────────────────────────────
+    # Console: WARNING+ only so AI replies aren't interleaved with INFO spam.
+    # File:    DEBUG+ if YOUMATTER_LOG_FILE is set, or if YOUMATTER_LOG_LEVEL
+    #          is set to DEBUG/INFO (useful for debugging without touching code).
+    _root_logger = logging.getLogger()
+    _console_handler = logging.StreamHandler()  # new handler just for this run
+    _console_handler.setLevel(
+        getattr(logging, os.getenv("YOUMATTER_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+    )
+    _console_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    # Remove all pre-existing handlers (the basicConfig one) and replace with
+    # our controlled WARNING-only handler so logs don't bleed into the chat UI.
+    _root_logger.handlers.clear()
+    _root_logger.addHandler(_console_handler)
+    _root_logger.setLevel(logging.DEBUG)  # root level stays DEBUG; handler gates output
+
+    _log_file = os.getenv("YOUMATTER_LOG_FILE")
+    if _log_file:
+        _file_handler = logging.FileHandler(_log_file, encoding="utf-8")
+        _file_handler.setLevel(logging.DEBUG)
+        _file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        _root_logger.addHandler(_file_handler)
+    # ─────────────────────────────────────────────────────────────────────────
+
     print("YouMatter AI is ready. Type 'quit' to exit.")
 
     user_id = input("Enter your user ID (or press Enter for 'test-user'): ").strip()
@@ -905,26 +1002,35 @@ async def _interactive_main():
             if user_input.lower() == "quit":
                 break
 
-            result = await chat(user_id, user_input, http_client, test_consent)
+            print("\nYouMatter: ", end="", flush=True)
+            safety_result = None
+            async for event in chat_stream(user_id, user_input, http_client, test_consent):
+                if event["type"] == "token":
+                    print(event["content"], end="", flush=True)
+                elif event["type"] == "safety_result":
+                    safety_result = event
+            # Blank line after the full response so the next prompt is visually separated.
+            print("\n", flush=True)
 
-            level = result["safety_level"]
-            if level == "severe":
-                if result["alert_sent"]:
-                    print("\n🚨 SEVERE CRISIS — Guardian alert sent\n")
-                else:
-                    print("\n🚨 SEVERE CRISIS — Alert NOT sent (check consent/config)\n")
-            elif level == "crisis":
-                print("\n⚠️  CRISIS DETECTED — Helplines shown, no guardian alert at this level\n")
-            elif level == "distress":
-                print("\n💛 Distress detected — AI in gentle mode\n")
+            if safety_result:
+                level = safety_result.get("safety_level")
+                if level == "severe":
+                    if safety_result.get("alert_sent"):
+                        print("🚨 SEVERE CRISIS — Guardian alert sent\n")
+                    else:
+                        print("🚨 SEVERE CRISIS — Alert NOT sent (check consent/config)\n")
+                    if safety_result.get("helplines"):
+                        print(f"{safety_result['helplines']}\n")
+                elif level == "crisis":
+                    print("⚠️  CRISIS DETECTED — Helplines shown, no guardian alert at this level\n")
+                elif level == "distress":
+                    print("💛 Distress detected — AI in gentle mode\n")
 
-            if result["show_consent_prompt"]:
-                print("\n💬 [App would show: 'Can we contact someone you trust?']\n")
+                if safety_result.get("show_consent_prompt"):
+                    print("💬 [App would show: 'Can we contact someone you trust?']\n")
 
-            if result["blocked"]:
-                print("\n🚫 Harmful request blocked\n")
-
-            print(f"\nYouMatter: {result['reply']}\n")
+                if safety_result.get("blocked"):
+                    print("🚫 Harmful request blocked\n")
 
 
 if __name__ == "__main__":
