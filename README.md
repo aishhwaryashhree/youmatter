@@ -174,11 +174,9 @@ youmatter/
 
 ---
 
-##  Team  
-
-- AI & Architecture — Aishwarya 
-- Backend — Harshita, Neeraj  
-- Frontend — Ankita, Simran, Rounit  
+## Team
+solo project by — Aishwarya 
+ 
 
 ---
 
@@ -200,3 +198,6 @@ Make mental health support **accessible, stigma-free, and always available**.
 <p align="center">
   <b>YouMatter — Because your mental health matters.</b> 🤍
 </p>
+
+<h2> Deployed link of AI</h2>
+https://youmatter-p0q8.onrender.com/
