@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>YouMatter - Auth Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+
+<body>
+    <h2>YouMatter Auth Test</h2>
+    <button id="loginBtn">Sign in with Google</button>
+    <button id="logoutBtn">Sign out</button>
+    <pre id="output">Not signed in.</pre>
+
+    <script>
+        const supabaseUrl = 'https://kitvwxsmgtvczbwnmxog.supabase.co';
+        const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpdHZ3eHNtZ3R2Y3pid25teG9nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODczOTg1NjksImV4cCI6MjEwMjk3NDU2OX0.T2Iv2RnYPnT1STaFdnbktQg97chX16SHOnu2_4RTMSU';
+        const supabaseClient = window.supabase.createClient(supabaseUrl, supabaseAnonKey);
+
+        document.getElementById('loginBtn').addEventListener('click', async () => {
+  await supabaseClient.auth.signInWithOAuth({
+    provider: 'google',
+    options: {
+      redirectTo: 'http://localhost:5000/test-login.html'
+    }
+  });
+});
+
+        document.getElementById('logoutBtn').addEventListener('click', async () => {
+            await supabaseClient.auth.signOut();
+            document.getElementById('output').textContent = 'Signed out.';
+        });
+
+        async function showSession() {
+            const { data } = await supabaseClient.auth.getSession();
+            if (data.session) {
+                document.getElementById('output').textContent =
+                    'Access token:\n' + data.session.access_token +
+                    '\n\nUser:\n' + JSON.stringify(data.session.user, null, 2);
+            }
+        }
+
+        showSession();
+    </script>
+</body>
+
+</html>
