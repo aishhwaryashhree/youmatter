@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const authRoutes = require('./routes/auth');
 const conversationRoutes = require('./routes/conversation');
+const messageRoutes = require('./routes/message');
 const requireAuth = require('./middleware/requireAuth');
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,6 +17,7 @@ app.get('/api/protected-test', requireAuth, (req, res) => {
 });
 app.use('/auth', authRoutes);
 app.use('/api/conversation', conversationRoutes);
+app.use('/message', messageRoutes);
 
 app.listen(PORT, () => {
     console.log(`Server is running on localhost:${PORT}`);
