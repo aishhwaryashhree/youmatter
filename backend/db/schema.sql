@@ -21,3 +21,17 @@ CREATE TABLE IF NOT EXISTS public.messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON public.messages (conversation_id);
+
+-- profiles table (editable user info + guardian contact)
+
+CREATE TABLE IF NOT EXISTS public.profiles (
+    user_id         uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    display_name    text,
+    guardian_name   text,
+    guardian_contact text,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE public.profiles
+ADD COLUMN IF NOT EXISTS current_concerns text,
+ADD COLUMN IF NOT EXISTS medical_history text;
