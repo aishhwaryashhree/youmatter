@@ -471,7 +471,7 @@ def _build_dynamic_prompt(topics: list, user_profile: str, keyword_result: dict)
     return dynamic_prompt
 
 
-async def chat(user_id: str, user_message: str, http_client, user_consent: dict = None):
+async def chat(user_id: str, user_message: str, http_client, user_consent: dict = None, token: str = "", conversation_id: str = None):
     """
     Full pipeline:
     1. Block harmful requests immediately
@@ -501,18 +501,17 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
     if is_blocked_request(user_message):
         blocked_reply = get_blocked_response()
 
-        # Still save to memory so we know this happened — concurrently, not sequentially
-        await asyncio.gather(
-            save_message(user_id, "user", user_message, http_client),
-            save_message(user_id, "assistant", blocked_reply, http_client),
-        )
+        # Still save to memory so we know this happened — sequentially so the assistant reply goes in the same conversation
+        conversation_id = await save_message(user_id, "user", user_message, http_client, token, conversation_id=conversation_id)
+        conversation_id = await save_message(user_id, "assistant", blocked_reply, http_client, token, conversation_id=conversation_id)
 
         return {
             "reply": blocked_reply,
             "safety_level": "severe",
             "blocked": True,
             "alert_sent": False,
-            "show_consent_prompt": not user_consent.get("guardian_alert", False)
+            "show_consent_prompt": not user_consent.get("guardian_alert", False),
+            "conversation_id": conversation_id
         }
 
     # Step 2 — Fast keyword safety layer runs first (instant, no network call)
@@ -531,10 +530,8 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
                 "Hey, that's a lot of messages really fast — "
                 "I'm still here, just give me a moment to catch up."
             )
-            await asyncio.gather(
-                save_message(user_id, "user", user_message, http_client),
-                save_message(user_id, "assistant", rate_reply, http_client),
-            )
+            conversation_id = await save_message(user_id, "user", user_message, http_client, token, conversation_id=conversation_id)
+            conversation_id = await save_message(user_id, "assistant", rate_reply, http_client, token, conversation_id=conversation_id)
             return {
                 "reply": rate_reply,
                 "safety_level": "safe",
@@ -542,6 +539,7 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
                 "alert_sent": False,
                 "show_consent_prompt": False,
                 "ai_score": None,
+                "conversation_id": conversation_id
             }
 
     # Step 3 — Load profile + history + classify topic & score, all
@@ -553,8 +551,8 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
     # needs its own separate round-trip later.
     _t0 = time.perf_counter()
     user_profile, raw_history, classification = await asyncio.gather(
-        load_user_profile(user_id, http_client),
-        load_memory(user_id, http_client),
+        load_user_profile(user_id, http_client, token),
+        load_memory(user_id, http_client, token),
         classify_topic_and_score(user_message, http_client),
     )
     logger.info(f"[TIMING] profile+memory+topic+score load: {time.perf_counter() - _t0:.2f}s")
@@ -584,10 +582,8 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
                 f"score={ai_score}, keyword_level={keyword_result['level']}, "
                 f"topics={topics}"
             )
-            await asyncio.gather(
-                save_message(user_id, "user", user_message, http_client),
-                save_message(user_id, "assistant", redirect, http_client),
-            )
+            conversation_id = await save_message(user_id, "user", user_message, http_client, token, conversation_id=conversation_id)
+            conversation_id = await save_message(user_id, "assistant", redirect, http_client, token, conversation_id=conversation_id)
             return {
                 "reply": redirect,
                 "safety_level": "safe",
@@ -595,6 +591,7 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
                 "alert_sent": False,
                 "show_consent_prompt": False,
                 "ai_score": ai_score,
+                "conversation_id": conversation_id
             }
 
     # Compute safety_result here — before _get_ai_reply — so the bypass
@@ -664,11 +661,9 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
         and not user_consent.get("guardian_alert", False)
     )
 
-    # Step 9 — Save both messages to memory concurrently
-    await asyncio.gather(
-        save_message(user_id, "user", user_message, http_client),
-        save_message(user_id, "assistant", reply, http_client),
-    )
+    # Step 9 — Save both messages to memory sequentially
+    conversation_id = await save_message(user_id, "user", user_message, http_client, token, conversation_id=conversation_id)
+    conversation_id = await save_message(user_id, "assistant", reply, http_client, token, conversation_id=conversation_id)
 
     return {
         "reply": reply,
@@ -676,11 +671,12 @@ async def chat(user_id: str, user_message: str, http_client, user_consent: dict 
         "blocked": False,
         "alert_sent": alert_sent,
         "show_consent_prompt": show_consent_prompt,
-        "ai_score": safety_result.get("ai_score", None)
+        "ai_score": safety_result.get("ai_score", None),
+        "conversation_id": conversation_id
     }
 
 
-async def chat_stream(user_id: str, user_message: str, http_client, user_consent: dict = None):
+async def chat_stream(user_id: str, user_message: str, http_client, user_consent: dict = None, token: str = "", conversation_id: str = None):
     """
     Streaming variant of chat(). Same full pipeline (blocked-request check,
     keyword safety, profile/memory/topic load, prompt build, alerts, memory
@@ -709,10 +705,8 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
     if is_blocked_request(user_message):
         blocked_reply = get_blocked_response()
 
-        await asyncio.gather(
-            save_message(user_id, "user", user_message, http_client),
-            save_message(user_id, "assistant", blocked_reply, http_client),
-        )
+        conversation_id = await save_message(user_id, "user", user_message, http_client, token, conversation_id=conversation_id)
+        conversation_id = await save_message(user_id, "assistant", blocked_reply, http_client, token, conversation_id=conversation_id)
 
         yield {"type": "token", "content": blocked_reply}
         yield {
@@ -722,6 +716,7 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
             "alert_sent": False,
             "show_consent_prompt": not user_consent.get("guardian_alert", False),
             "helplines": HELPLINES,
+            "conversation_id": conversation_id
         }
         return
 
@@ -741,10 +736,8 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
                 "Hey, that's a lot of messages really fast — "
                 "I'm still here, just give me a moment to catch up."
             )
-            await asyncio.gather(
-                save_message(user_id, "user", user_message, http_client),
-                save_message(user_id, "assistant", rate_reply, http_client),
-            )
+            conversation_id = await save_message(user_id, "user", user_message, http_client, token, conversation_id=conversation_id)
+            conversation_id = await save_message(user_id, "assistant", rate_reply, http_client, token, conversation_id=conversation_id)
             yield {"type": "token", "content": rate_reply}
             yield {
                 "type": "safety_result",
@@ -753,6 +746,7 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
                 "alert_sent": False,
                 "show_consent_prompt": False,
                 "helplines": None,
+                "conversation_id": conversation_id
             }
             return
 
@@ -760,8 +754,8 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
     # concurrently (same merged call as chat() — see classify_topic_and_score).
     _t0 = time.perf_counter()
     user_profile, raw_history, classification = await asyncio.gather(
-        load_user_profile(user_id, http_client),
-        load_memory(user_id, http_client),
+        load_user_profile(user_id, http_client, token),
+        load_memory(user_id, http_client, token),
         classify_topic_and_score(user_message, http_client),
     )
     logger.info(f"[TIMING] chat_stream profile+memory+topic+score load: {time.perf_counter() - _t0:.2f}s")
@@ -784,10 +778,8 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
                 f"score={ai_score}, keyword_level={keyword_result['level']}, "
                 f"topics={topics}"
             )
-            await asyncio.gather(
-                save_message(user_id, "user", user_message, http_client),
-                save_message(user_id, "assistant", redirect, http_client),
-            )
+            conversation_id = await save_message(user_id, "user", user_message, http_client, token, conversation_id=conversation_id)
+            conversation_id = await save_message(user_id, "assistant", redirect, http_client, token, conversation_id=conversation_id)
             yield {"type": "token", "content": redirect}
             yield {
                 "type": "safety_result",
@@ -796,6 +788,7 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
                 "alert_sent": False,
                 "show_consent_prompt": False,
                 "helplines": None,
+                "conversation_id": conversation_id
             }
             return
 
@@ -928,12 +921,10 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
         and not user_consent.get("guardian_alert", False)
     )
 
-    # Step 9 — Save both messages to memory concurrently using the
+    # Step 9 — Save both messages to memory sequentially using the
     # accumulated full_reply (same as chat() does with its reply variable).
-    await asyncio.gather(
-        save_message(user_id, "user", user_message, http_client),
-        save_message(user_id, "assistant", full_reply, http_client),
-    )
+    conversation_id = await save_message(user_id, "user", user_message, http_client, token, conversation_id=conversation_id)
+    conversation_id = await save_message(user_id, "assistant", full_reply, http_client, token, conversation_id=conversation_id)
 
     # Final event — safety metadata that can't be merged into the token stream
     # because the tokens have already been sent to the client.
@@ -944,6 +935,7 @@ async def chat_stream(user_id: str, user_message: str, http_client, user_consent
         "alert_sent": alert_sent,
         "show_consent_prompt": show_consent_prompt,
         "helplines": HELPLINES if safety_result["level"] == "severe" else None,
+        "conversation_id": conversation_id
     }
 
 

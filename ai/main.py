@@ -43,6 +43,7 @@ class ChatRequest(BaseModel):
         "guardian_email": None,
         "guardian_name": None
     }
+    conversation_id: str = None
 
 
 @app.get("/health")
@@ -53,11 +54,16 @@ def health_check():
 @app.post("/chat/{user_id}")
 async def chat_endpoint(user_id: str, request: Request, body: ChatRequest):
     try:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+        
         result = await chat(
             user_id=user_id,
             user_message=body.message,
             http_client=app.state.http_client,
-            user_consent=body.consent
+            user_consent=body.consent,
+            token=token,
+            conversation_id=body.conversation_id
         )
         return result
     except Exception as e:
@@ -86,11 +92,15 @@ async def ws_chat(websocket: WebSocket, user_id: str):
                 data = await websocket.receive_json()
                 message = data.get("message", "")
                 consent = data.get("consent", None)
+                token = data.get("token", "")
+                conversation_id = data.get("conversation_id", None)
                 async for event in chat_stream(
                     user_id=user_id,
                     user_message=message,
                     http_client=websocket.app.state.http_client,
                     user_consent=consent,
+                    token=token,
+                    conversation_id=conversation_id,
                 ):
                     await websocket.send_json(event)
             except WebSocketDisconnect:
