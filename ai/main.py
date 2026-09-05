@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from ai_core import chat, chat_stream
+from memory import BACKEND_URL
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("youmatter.main")
@@ -46,6 +47,26 @@ class ChatRequest(BaseModel):
     conversation_id: str = None
 
 
+async def verify_user_token(user_id: str, token: str, http_client) -> bool:
+    """
+    Verifies the token belongs to this user_id by calling the backend's
+    GET /api/user/{user_id}, which already enforces JWT validity + ownership.
+    Returns True only if the backend responds with 200.
+    """
+    if not token:
+        return False
+    try:
+        response = await http_client.get(
+            f"{BACKEND_URL}/api/user/{user_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5.0
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"verify_user_token failed for user {user_id}: {e}", exc_info=True)
+        return False
+
+
 @app.get("/health")
 def health_check():
     return {"status": "YouMatter AI is running"}
@@ -56,7 +77,11 @@ async def chat_endpoint(user_id: str, request: Request, body: ChatRequest):
     try:
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
-        
+
+        is_valid = await verify_user_token(user_id, token, app.state.http_client)
+        if not is_valid:
+            raise HTTPException(status_code=401, detail="Invalid or unauthorized token")
+
         result = await chat(
             user_id=user_id,
             user_message=body.message,
@@ -66,6 +91,8 @@ async def chat_endpoint(user_id: str, request: Request, body: ChatRequest):
             conversation_id=body.conversation_id
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"chat_endpoint failed for user {user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Something went wrong processing your message.")
@@ -94,6 +121,13 @@ async def ws_chat(websocket: WebSocket, user_id: str):
                 consent = data.get("consent", None)
                 token = data.get("token", "")
                 conversation_id = data.get("conversation_id", None)
+                
+                is_valid = await verify_user_token(user_id, token, websocket.app.state.http_client)
+                if not is_valid:
+                    await websocket.send_json({"type": "error", "detail": "Invalid or unauthorized token"})
+                    await websocket.close()
+                    return
+
                 async for event in chat_stream(
                     user_id=user_id,
                     user_message=message,
